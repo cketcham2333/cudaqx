@@ -496,6 +496,10 @@ resolve_paths() {
     fi
 
     # Default IB device names (if network setup didn't set them)
+    # If --device was given, use it as BRIDGE_DEVICE when --setup-network was skipped
+    if [ -z "${BRIDGE_DEVICE:-}" ] && [ -n "${IB_DEVICE:-}" ]; then
+        BRIDGE_DEVICE="$IB_DEVICE"
+    fi
     : "${BRIDGE_DEVICE:=rocep1s0f0}"
     if $EMULATE; then
         : "${EMULATOR_DEVICE:=rocep1s0f1}"
