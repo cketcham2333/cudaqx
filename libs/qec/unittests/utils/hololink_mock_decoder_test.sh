@@ -693,7 +693,7 @@ run_fpga() {
     _info "Bridge RKey:   $bridge_rkey"
     _info "Bridge Buffer: $bridge_addr"
 
-    # ---- 2. Start playback tool ----
+    # ---- 2. Start playback tool (reset + configure + play in one shot) ----
     _log "Starting syndrome playback (fpga=$FPGA_IP)"
     local playback_args=(
         --hololink "$FPGA_IP"
