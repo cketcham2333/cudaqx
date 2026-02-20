@@ -7,6 +7,7 @@
  ******************************************************************************/
 
 #include <new>
+#include <cstdio>
 
 #include "cudaq/nvqlink/daemon/dispatcher/dispatch_kernel_launch.h"
 #include "cudaq/qec/realtime/mock_decode_handler.cuh"

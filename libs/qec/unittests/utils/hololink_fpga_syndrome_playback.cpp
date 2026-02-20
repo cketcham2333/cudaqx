@@ -835,7 +835,8 @@ int main(int argc, char **argv) {
     windows.push_back(build_rpc_payload(syndromes[i].measurements, function_id));
 
   std::size_t payload_size = windows.front().size();
-  std::size_t bytes_per_window = align_up(payload_size, 64);
+  // DIAG: use 256-byte windows (4 cycles) for reliable FPGA delivery
+  std::size_t bytes_per_window = align_up(payload_size, 256);
 
   for (auto &window : windows)
     window.resize(bytes_per_window, 0);
@@ -998,43 +999,56 @@ int main(int argc, char **argv) {
   // ------------------------------------------------------------------
   if (options.verify) {
     std::cout << "\n=== ILA Capture & Verification ===\n";
-    std::cout << "Waiting for " << num_shots << " correction responses...\n";
 
-    constexpr int kVerifyTimeoutMs = 5000;
-    bool captured = ila_wait_for_samples(
-        *hololink, static_cast<std::uint32_t>(num_shots), kVerifyTimeoutMs);
+    // Wait for the ILA buffer to fill completely.  The BRAM player loops
+    // continuously, so corrections keep flowing as long as the bridge is
+    // alive.  A full buffer is required because the current FPGA RTL only
+    // allows data RAM reads after the buffer is full and the ILA is disabled.
+    // The sample address register is 0-based, so a full buffer reads back
+    // as ILA_DEPTH - 1.
+    constexpr std::uint32_t kIlaFull = ILA_DEPTH - 1;
+    constexpr int kVerifyTimeoutMs = 30000;
+    std::cout << "Waiting for ILA buffer to fill (" << kIlaFull
+              << "+ samples, timeout " << kVerifyTimeoutMs << " ms)...\n";
+    bool filled = ila_wait_for_samples(*hololink, kIlaFull, kVerifyTimeoutMs);
 
     std::uint32_t actual_samples = ila_sample_count(*hololink);
     ila_disable(*hololink);
 
-    if (!captured) {
+    if (!filled) {
       std::cerr << "ILA: only captured " << actual_samples << " of "
-                << num_shots << " expected samples (timeout "
-                << kVerifyTimeoutMs << " ms)\n";
-      if (actual_samples == 0)
-        return 1;
-      std::cout << "Proceeding with " << actual_samples
-                << " captured samples\n";
-    } else {
-      std::cout << "ILA: captured " << actual_samples << " samples\n";
+                << kIlaFull << " (timeout " << kVerifyTimeoutMs << " ms)\n";
+      return 1;
     }
+    std::cout << "ILA: buffer full (" << actual_samples << " samples)\n";
 
-    // ILA data RAM reads (0x4010_0000+) are not currently supported by
-    // the FPGA firmware — they return RESPONSE_INVALID_ADDR and corrupt
-    // the control-plane sequence counter.  Verify using the ILA sample
-    // count: if count >= expected shots, correction responses were
-    // transmitted back to the FPGA.
-    // TODO: re-enable full ILA data readback + verify_captured_responses
-    // once the FPGA firmware supports reads from ILA RAM banks.
+    // Read captured data from ILA RAM banks.
+    std::cout << "Reading ILA data RAM...\n";
+    auto samples = ila_dump(*hololink, ILA_DEPTH);
+    std::cout << "Read " << samples.size() << " samples from ILA\n";
+
+    // Verify correction responses against expected values.
+    auto vr = verify_captured_responses(samples, syndromes, num_shots);
+
     std::cout << "\n=== Verification Summary ===\n"
               << "  ILA samples captured:   " << actual_samples << "\n"
+              << "  RPC responses found:    "
+              << (vr.responses_matched + vr.header_errors +
+                  vr.correction_errors)
+              << "\n"
+              << "  Corrections matched:    " << vr.responses_matched << "\n"
+              << "  Header errors:          " << vr.header_errors << "\n"
+              << "  Correction errors:      " << vr.correction_errors << "\n"
               << "  Expected shots:         " << num_shots << "\n";
-    if (actual_samples >= static_cast<std::uint32_t>(num_shots)) {
-      std::cout << "  RESULT: PASS (ILA captured >= expected shots)\n";
-    } else {
+    if (vr.correction_errors > 0 || vr.header_errors > 0) {
       std::cout << "  RESULT: FAIL\n";
       return 1;
     }
+    if (vr.responses_matched == 0) {
+      std::cout << "  RESULT: FAIL (no valid responses found)\n";
+      return 1;
+    }
+    std::cout << "  RESULT: PASS\n";
   }
 
   return 0;
