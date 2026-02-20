@@ -658,6 +658,10 @@ struct VerifyResult {
   std::size_t responses_matched = 0;
   std::size_t header_errors = 0;
   std::size_t correction_errors = 0;
+  std::size_t rpc_requests = 0;
+  std::size_t rpc_responses = 0;
+  std::size_t non_rpc_frames = 0;
+  std::size_t tvalid_zero = 0;
 };
 
 /// Scan captured ILA samples for RPC correction responses and compare each
@@ -684,8 +688,10 @@ VerifyResult verify_captured_responses(
     std::uint32_t wr_tcnt =
         extract_field(sample, ILA_WR_TCNT_LSB, ILA_WR_TCNT_WIDTH);
 
-    if (!tvalid)
+    if (!tvalid) {
+      result.tvalid_zero++;
       continue;
+    }
 
     // Extract the raw payload bytes from the 512-bit data bus.
     constexpr std::size_t kResponseSize =
@@ -697,38 +703,17 @@ VerifyResult verify_captured_responses(
     std::uint8_t correction_byte =
         data_bytes[sizeof(cudaq::nvqlink::RPCResponse)];
 
-    std::cout << "  Sample " << i << " (tlast=" << tlast
-              << " wr_tcnt=" << wr_tcnt << "):\n";
-    std::cout << "    Raw first 16 bytes:";
-    for (std::size_t b = 0; b < 16 && b < data_bytes.size(); ++b) {
-      std::cout << " " << std::hex << std::setfill('0') << std::setw(2)
-                << static_cast<int>(data_bytes[b]);
-    }
-    std::cout << std::dec << "\n";
-
-    if (resp.magic != cudaq::nvqlink::RPC_MAGIC_RESPONSE) {
-      std::cout << "    WARNING: magic=0x" << std::hex << resp.magic
-                << " does not match RPC_MAGIC_RESPONSE (0x"
-                << cudaq::nvqlink::RPC_MAGIC_RESPONSE << ")" << std::dec
-                << " — skipping non-RPC frame\n";
+    if (resp.magic == cudaq::nvqlink::RPC_MAGIC_REQUEST) {
+      result.rpc_requests++;
       continue;
     }
+    if (resp.magic != cudaq::nvqlink::RPC_MAGIC_RESPONSE) {
+      result.non_rpc_frames++;
+      continue;
+    }
+    result.rpc_responses++;
 
-    std::cout << "    RPCResponse: magic=0x" << std::hex << resp.magic
-              << std::dec << " status=" << resp.status
-              << " result_len=" << resp.result_len << "\n";
-
-    bool header_ok = true;
     if (resp.status != 0) {
-      std::cout << "    ERROR: status=" << resp.status << " (expected 0)\n";
-      header_ok = false;
-    }
-    if (resp.result_len != 1) {
-      std::cout << "    WARNING: result_len=" << resp.result_len
-                << " (expected 1 for single correction byte)\n";
-    }
-
-    if (!header_ok) {
       result.header_errors++;
       response_idx++;
       continue;
@@ -737,13 +722,12 @@ VerifyResult verify_captured_responses(
     std::uint8_t expected = (response_idx < syndromes.size())
                                 ? syndromes[response_idx].expected_correction
                                 : 0;
-    std::cout << "    Correction: got=" << static_cast<int>(correction_byte)
-              << " expected=" << static_cast<int>(expected);
     if (correction_byte == expected) {
-      std::cout << " [PASS]\n";
       result.responses_matched++;
     } else {
-      std::cout << " [FAIL]\n";
+      std::cout << "  Sample " << i << " shot " << response_idx
+                << ": got=" << static_cast<int>(correction_byte)
+                << " expected=" << static_cast<int>(expected) << " [FAIL]\n";
       result.correction_errors++;
     }
 
@@ -835,8 +819,7 @@ int main(int argc, char **argv) {
     windows.push_back(build_rpc_payload(syndromes[i].measurements, function_id));
 
   std::size_t payload_size = windows.front().size();
-  // DIAG: use 256-byte windows (4 cycles) for reliable FPGA delivery
-  std::size_t bytes_per_window = align_up(payload_size, 256);
+  std::size_t bytes_per_window = align_up(payload_size, 64);
 
   for (auto &window : windows)
     window.resize(bytes_per_window, 0);
@@ -1032,10 +1015,10 @@ int main(int argc, char **argv) {
 
     std::cout << "\n=== Verification Summary ===\n"
               << "  ILA samples captured:   " << actual_samples << "\n"
-              << "  RPC responses found:    "
-              << (vr.responses_matched + vr.header_errors +
-                  vr.correction_errors)
-              << "\n"
+              << "  tvalid=0 (idle):        " << vr.tvalid_zero << "\n"
+              << "  RPC requests (syndromes): " << vr.rpc_requests << "\n"
+              << "  RPC responses (corrections): " << vr.rpc_responses << "\n"
+              << "  Non-RPC frames:         " << vr.non_rpc_frames << "\n"
               << "  Corrections matched:    " << vr.responses_matched << "\n"
               << "  Header errors:          " << vr.header_errors << "\n"
               << "  Correction errors:      " << vr.correction_errors << "\n"
