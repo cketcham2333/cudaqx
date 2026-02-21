@@ -403,6 +403,7 @@ protected:
     header->function_id =
         cudaq::qec::realtime::MOCK_DECODE_FUNCTION_ID;
     header->arg_len = static_cast<std::uint32_t>(measurements.size());
+    header->request_id = static_cast<std::uint32_t>(slot);
 
     // Write measurement data after header
     memcpy(slot_data + sizeof(cudaq::nvqlink::RPCHeader), measurements.data(),

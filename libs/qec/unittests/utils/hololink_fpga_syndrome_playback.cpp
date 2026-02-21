@@ -14,6 +14,7 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -253,7 +254,8 @@ std::vector<SyndromeEntry> load_syndromes(const std::string &path,
 
 std::vector<std::uint8_t>
 build_rpc_payload(const std::vector<std::uint8_t> &measurements,
-                  std::uint32_t function_id) {
+                  std::uint32_t function_id,
+                  std::uint32_t request_id = 0) {
   std::vector<std::uint8_t> payload(sizeof(cudaq::nvqlink::RPCHeader) +
                                     measurements.size());
 
@@ -261,6 +263,7 @@ build_rpc_payload(const std::vector<std::uint8_t> &measurements,
   header->magic = cudaq::nvqlink::RPC_MAGIC_REQUEST;
   header->function_id = function_id;
   header->arg_len = static_cast<std::uint32_t>(measurements.size());
+  header->request_id = request_id;
 
   std::memcpy(payload.data() + sizeof(cudaq::nvqlink::RPCHeader),
               measurements.data(), measurements.size());
@@ -671,31 +674,28 @@ struct VerifyResult {
 ///   bytes [0:3]   RPCResponse.magic      = 0x43555153 (RPC_MAGIC_RESPONSE)
 ///   bytes [4:7]   RPCResponse.status     = 0 (success)
 ///   bytes [8:11]  RPCResponse.result_len = 1
-///   byte  [12]    correction value
+///   bytes [12:15] RPCResponse.request_id = shot index (echoed from request)
+///   byte  [16]    correction value
 VerifyResult verify_captured_responses(
     const std::vector<std::vector<std::uint32_t>> &samples,
     const std::vector<SyndromeEntry> &syndromes, std::size_t num_expected) {
   VerifyResult result;
   result.total_samples = samples.size();
-  std::size_t response_idx = 0;
+  std::size_t response_count = 0;
+  std::set<std::uint32_t> shots_seen;
 
-  for (std::size_t i = 0; i < samples.size() && response_idx < num_expected;
-       ++i) {
+  for (std::size_t i = 0; i < samples.size(); ++i) {
     const auto &sample = samples[i];
 
     bool tvalid = extract_bit(sample, ILA_TVALID_BIT);
-    bool tlast = extract_bit(sample, ILA_TLAST_BIT);
-    std::uint32_t wr_tcnt =
-        extract_field(sample, ILA_WR_TCNT_LSB, ILA_WR_TCNT_WIDTH);
 
     if (!tvalid) {
       result.tvalid_zero++;
       continue;
     }
 
-    // Extract the raw payload bytes from the 512-bit data bus.
     constexpr std::size_t kResponseSize =
-        sizeof(cudaq::nvqlink::RPCResponse) + 1; // header + 1 correction byte
+        sizeof(cudaq::nvqlink::RPCResponse) + 1;
     auto data_bytes = extract_tdata_bytes(sample, kResponseSize);
 
     cudaq::nvqlink::RPCResponse resp{};
@@ -715,24 +715,36 @@ VerifyResult verify_captured_responses(
 
     if (resp.status != 0) {
       result.header_errors++;
-      response_idx++;
       continue;
     }
 
-    std::uint8_t expected = (response_idx < syndromes.size())
-                                ? syndromes[response_idx].expected_correction
-                                : 0;
+    std::uint32_t shot_index = resp.request_id;
+    if (shot_index >= syndromes.size()) {
+      std::cout << "  Sample " << i
+                << ": request_id=" << shot_index
+                << " out of range (num_shots=" << syndromes.size()
+                << ") [WARN]\n";
+      result.correction_errors++;
+      continue;
+    }
+
+    std::uint8_t expected = syndromes[shot_index].expected_correction;
     if (correction_byte == expected) {
       result.responses_matched++;
     } else {
-      std::cout << "  Sample " << i << " shot " << response_idx
+      std::cout << "  Sample " << i
+                << " request_id=" << shot_index
                 << ": got=" << static_cast<int>(correction_byte)
                 << " expected=" << static_cast<int>(expected) << " [FAIL]\n";
       result.correction_errors++;
     }
 
-    response_idx++;
+    shots_seen.insert(shot_index);
+    response_count++;
   }
+
+  std::cout << "  Unique shots verified:  " << shots_seen.size()
+            << " of " << num_expected << "\n";
 
   return result;
 }
@@ -816,7 +828,9 @@ int main(int argc, char **argv) {
   std::vector<std::vector<std::uint8_t>> windows;
   windows.reserve(num_shots);
   for (std::size_t i = 0; i < num_shots; ++i)
-    windows.push_back(build_rpc_payload(syndromes[i].measurements, function_id));
+    windows.push_back(
+        build_rpc_payload(syndromes[i].measurements, function_id,
+                          static_cast<std::uint32_t>(i)));
 
   std::size_t payload_size = windows.front().size();
   std::size_t bytes_per_window = align_up(payload_size, 64);

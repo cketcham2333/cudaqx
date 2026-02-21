@@ -121,11 +121,13 @@ __global__ void mock_decode_graph_kernel(
       response->magic = cudaq::nvqlink::RPC_MAGIC_RESPONSE;
       response->status = 0;
       response->result_len = static_cast<std::uint32_t>(ctx.num_observables);
+      response->request_id = header->request_id;
     } else {
       // Error: decoder not set
       response->magic = cudaq::nvqlink::RPC_MAGIC_RESPONSE;
       response->status = -1;
       response->result_len = 0;
+      response->request_id = header->request_id;
     }
 
     // Signal completion: write tx_flag so the host/emulator knows the
