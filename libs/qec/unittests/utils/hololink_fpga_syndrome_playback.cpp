@@ -43,8 +43,16 @@ constexpr std::uint32_t PLAYER_ENABLE_OFFSET = 0x0004;
 constexpr std::uint32_t RAM_NUM = 16;
 constexpr std::uint32_t RAM_DEPTH = 512;
 
-constexpr std::uint32_t PLAYER_ENABLE = 0x0000'0001;
+constexpr std::uint32_t PLAYER_ENABLE = 0x0000'0005; // enable + single-pass (no loop)
 constexpr std::uint32_t PLAYER_DISABLE = 0x0000'0000;
+
+// Sensor TX streaming threshold register. The Host→FPGA path buffers
+// incoming data until this byte threshold is met before streaming to the
+// sensor (ILA). Setting this to 0 (value 0x5) causes data to stream
+// immediately, which is required when the total capture is small enough
+// to sit entirely within the default buffer.
+constexpr std::uint32_t SIF_TX_THRESHOLD_ADDR = 0x0120'0000;
+constexpr std::uint32_t SIF_TX_THRESHOLD_IMMEDIATE = 0x0000'0005;
 
 constexpr std::uint32_t DEFAULT_TIMER_SPACING_US = 10;
 constexpr std::uint32_t RF_SOC_TIMER_SCALE = 322;
@@ -982,6 +990,14 @@ int main(int argc, char **argv) {
   }
 
   // ------------------------------------------------------------------
+  // Set sensor TX streaming threshold to zero so captured responses
+  // stream to the ILA immediately (required for small capture counts).
+  // ------------------------------------------------------------------
+  if (!hololink->write_uint32(SIF_TX_THRESHOLD_ADDR,
+                              SIF_TX_THRESHOLD_IMMEDIATE))
+    throw std::runtime_error("Failed to set SIF TX streaming threshold");
+
+  // ------------------------------------------------------------------
   // Enable playback
   // ------------------------------------------------------------------
   if (!hololink->write_uint32(PLAYER_ADDR + PLAYER_ENABLE_OFFSET,
@@ -997,31 +1013,45 @@ int main(int argc, char **argv) {
   if (options.verify) {
     std::cout << "\n=== ILA Capture & Verification ===\n";
 
-    // Wait for the ILA buffer to fill completely.  The BRAM player loops
-    // continuously, so corrections keep flowing as long as the bridge is
-    // alive.  A full buffer is required because the current FPGA RTL only
-    // allows data RAM reads after the buffer is full and the ILA is disabled.
-    // The sample address register is 0-based, so a full buffer reads back
-    // as ILA_DEPTH - 1.
-    constexpr std::uint32_t kIlaFull = ILA_DEPTH - 1;
+    // In single-pass mode the player sends exactly num_shots packets, so the
+    // ILA buffer will not fill completely.  Poll until the sample count
+    // stabilises (no new samples for 2 consecutive checks).
+    constexpr int kStableChecks = 2;
+    constexpr int kPollIntervalMs = 500;
     constexpr int kVerifyTimeoutMs = 30000;
-    std::cout << "Waiting for ILA buffer to fill (" << kIlaFull
-              << "+ samples, timeout " << kVerifyTimeoutMs << " ms)...\n";
-    bool filled = ila_wait_for_samples(*hololink, kIlaFull, kVerifyTimeoutMs);
+    std::cout << "Waiting for ILA capture to stabilise (timeout "
+              << kVerifyTimeoutMs << " ms)...\n";
+
+    std::uint32_t prev_count = 0;
+    int stable = 0;
+    int elapsed = 0;
+    while (elapsed < kVerifyTimeoutMs) {
+      std::this_thread::sleep_for(
+          std::chrono::milliseconds(kPollIntervalMs));
+      elapsed += kPollIntervalMs;
+      std::uint32_t count = ila_sample_count(*hololink);
+      if (count > 0 && count == prev_count)
+        ++stable;
+      else
+        stable = 0;
+      prev_count = count;
+      if (stable >= kStableChecks)
+        break;
+    }
 
     std::uint32_t actual_samples = ila_sample_count(*hololink);
     ila_disable(*hololink);
 
-    if (!filled) {
-      std::cerr << "ILA: only captured " << actual_samples << " of "
-                << kIlaFull << " (timeout " << kVerifyTimeoutMs << " ms)\n";
+    if (actual_samples == 0) {
+      std::cerr << "ILA: captured 0 samples (timeout " << kVerifyTimeoutMs
+                << " ms)\n";
       return 1;
     }
-    std::cout << "ILA: buffer full (" << actual_samples << " samples)\n";
+    std::cout << "ILA: captured " << actual_samples << " samples\n";
 
     // Read captured data from ILA RAM banks.
     std::cout << "Reading ILA data RAM...\n";
-    auto samples = ila_dump(*hololink, ILA_DEPTH);
+    auto samples = ila_dump(*hololink, actual_samples);
     std::cout << "Read " << samples.size() << " samples from ILA\n";
 
     // Verify correction responses against expected values.
