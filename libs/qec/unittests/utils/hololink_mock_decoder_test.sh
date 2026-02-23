@@ -63,7 +63,7 @@ NUM_SHOTS=""
 # and 128-byte aligned (Hololink PAGE_SIZE=128).  384 safely covers the
 # typical frame_size of 268 bytes without requiring adjustment.
 PAGE_SIZE=384
-NUM_PAGES=64
+NUM_PAGES=128
 CONTROL_PORT=8193
 
 # Build parallelism
@@ -109,7 +109,7 @@ Run options:
   --no-verify            Skip ILA correction verification (verify is ON by default)
   --num-shots N          Limit number of shots
   --page-size N          Ring buffer slot size in bytes (default: 256)
-  --num-pages N          Number of ring buffer slots (default: 64)
+  --num-pages N          Number of ring buffer slots (default: 128)
   --control-port N       UDP control port for emulator (default: 8193)
 
   --help, -h             Show this help
