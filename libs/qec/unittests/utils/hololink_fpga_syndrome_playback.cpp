@@ -54,7 +54,7 @@ constexpr std::uint32_t PLAYER_DISABLE = 0x0000'0000;
 constexpr std::uint32_t SIF_TX_THRESHOLD_ADDR = 0x0120'0000;
 constexpr std::uint32_t SIF_TX_THRESHOLD_IMMEDIATE = 0x0000'0005;
 
-constexpr std::uint32_t DEFAULT_TIMER_SPACING_US = 10;
+constexpr std::uint32_t DEFAULT_TIMER_SPACING_US = 120;
 constexpr std::uint32_t RF_SOC_TIMER_SCALE = 322;
 
 constexpr std::uint32_t MOCK_DECODE_FUNCTION_ID =
