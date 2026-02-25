@@ -391,10 +391,8 @@ protected:
   }
 
   /// @brief Write syndrome to RX buffer in RPC format.
-  /// Layout: [RPCHeader][8-byte PTP placeholder][measurement data]
   void write_rpc_request(std::size_t slot,
                          const std::vector<uint8_t> &measurements) {
-    constexpr std::size_t PTP_TS_LEN = 8;
     uint8_t *slot_data =
         const_cast<uint8_t *>(rx_data_host_) + slot * slot_size_;
 
@@ -404,13 +402,12 @@ protected:
     header->function_id =
         cudaq::qec::realtime::MOCK_DECODE_FUNCTION_ID;
     header->arg_len =
-        static_cast<std::uint32_t>(PTP_TS_LEN + measurements.size());
+        static_cast<std::uint32_t>(measurements.size());
     header->request_id = static_cast<std::uint32_t>(slot);
+    header->ptp_timestamp = 0;
 
-    // Zero PTP placeholder, then write measurement data
     uint8_t *payload = slot_data + sizeof(cudaq::nvqlink::RPCHeader);
-    memset(payload, 0, PTP_TS_LEN);
-    memcpy(payload + PTP_TS_LEN, measurements.data(), measurements.size());
+    memcpy(payload, measurements.data(), measurements.size());
   }
 
   /// @brief Read response from TX buffer (symmetric: dispatch kernel writes to TX).
@@ -421,7 +418,6 @@ protected:
     const uint8_t *slot_data =
         const_cast<uint8_t *>(tx_data_host_) + slot * slot_size_;
 
-    // Read RPCResponse
     const cudaq::nvqlink::RPCResponse *response =
         reinterpret_cast<const cudaq::nvqlink::RPCResponse *>(slot_data);
 
@@ -437,9 +433,7 @@ protected:
       return false;
     }
 
-    // Skip PTP timestamp echo (8 bytes) to reach correction data.
-    constexpr std::size_t PTP_TS_LEN = 8;
-    correction = *(slot_data + sizeof(cudaq::nvqlink::RPCResponse) + PTP_TS_LEN);
+    correction = *(slot_data + sizeof(cudaq::nvqlink::RPCResponse));
     return true;
   }
 

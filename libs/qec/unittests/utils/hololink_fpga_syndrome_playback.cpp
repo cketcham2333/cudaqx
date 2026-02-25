@@ -98,8 +98,6 @@ constexpr std::uint32_t ILA_TLAST_BIT = 513;
 constexpr std::uint32_t ILA_WR_TCNT_LSB = 514;
 constexpr std::uint32_t ILA_WR_TCNT_WIDTH = 7;
 
-constexpr std::uint32_t PTP_TS_LEN = 8;
-
 // ============================================================================
 // Helper Functions
 // ============================================================================
@@ -265,14 +263,14 @@ std::vector<SyndromeEntry> load_syndromes(const std::string &path,
 }
 
 /// Build an RPC request message.
-/// Layout: [RPCHeader][8-byte PTP placeholder][syndrome measurements...]
-/// The FPGA overwrites the PTP placeholder with the PTP send timestamp at
-/// transmit time.
+/// Layout: [RPCHeader (24 bytes, ptp_timestamp zeroed)][syndrome measurements...]
+/// The FPGA overwrites header bytes 16-23 (ptp_timestamp field) with the PTP
+/// send timestamp at transmit time.
 std::vector<std::uint8_t>
 build_rpc_payload(const std::vector<std::uint8_t> &measurements,
                   std::uint32_t function_id,
                   std::uint32_t request_id = 0) {
-  std::size_t arg_len = PTP_TS_LEN + measurements.size();
+  std::size_t arg_len = measurements.size();
   std::vector<std::uint8_t> payload(sizeof(cudaq::nvqlink::RPCHeader) +
                                     arg_len, 0);
 
@@ -281,9 +279,9 @@ build_rpc_payload(const std::vector<std::uint8_t> &measurements,
   header->function_id = function_id;
   header->arg_len = static_cast<std::uint32_t>(arg_len);
   header->request_id = request_id;
+  header->ptp_timestamp = 0;
 
-  // First PTP_TS_LEN bytes after header are zero (FPGA injects PTP here).
-  std::memcpy(payload.data() + sizeof(cudaq::nvqlink::RPCHeader) + PTP_TS_LEN,
+  std::memcpy(payload.data() + sizeof(cudaq::nvqlink::RPCHeader),
               measurements.data(), measurements.size());
   return payload;
 }
@@ -688,13 +686,10 @@ std::uint64_t extract_ila_ptp_timestamp(
   return raw;
 }
 
-/// Extract the echoed PTP send timestamp from the first 8 bytes of the
-/// RPC response payload.
-std::uint64_t extract_echoed_ptp_timestamp(const std::uint8_t *result_data) {
-  uint64_t raw = 0;
-  for (int i = 0; i < 8; ++i)
-    raw |= uint64_t(result_data[i]) << (i * 8);
-  return raw;
+/// Extract the echoed PTP send timestamp from RPCResponse.ptp_timestamp.
+std::uint64_t extract_echoed_ptp_timestamp(
+    const cudaq::nvqlink::RPCResponse &resp) {
+  return resp.ptp_timestamp;
 }
 
 struct PtpTimestamp {
@@ -740,11 +735,11 @@ struct VerifyResult {
 /// against the expected values from the syndromes file.
 ///
 /// Each captured 512-bit data word should contain a complete RPCResponse:
-///   bytes [0:3]   RPCResponse.magic      = 0x43555153 (RPC_MAGIC_RESPONSE)
-///   bytes [4:7]   RPCResponse.status     = 0 (success)
-///   bytes [8:11]  RPCResponse.result_len = PTP_TS_LEN + num_observables
-///   bytes [12:15] RPCResponse.request_id = shot index (echoed from request)
-///   bytes [16:23] echoed PTP send timestamp
+///   bytes [0:3]   RPCResponse.magic         = 0x43555153 (RPC_MAGIC_RESPONSE)
+///   bytes [4:7]   RPCResponse.status        = 0 (success)
+///   bytes [8:11]  RPCResponse.result_len    = num_observables
+///   bytes [12:15] RPCResponse.request_id    = shot index (echoed from request)
+///   bytes [16:23] RPCResponse.ptp_timestamp = echoed PTP send timestamp
 ///   byte  [24]    correction value
 VerifyResult verify_captured_responses(
     const std::vector<std::vector<std::uint32_t>> &samples,
@@ -765,13 +760,13 @@ VerifyResult verify_captured_responses(
     }
 
     constexpr std::size_t kResponseSize =
-        sizeof(cudaq::nvqlink::RPCResponse) + PTP_TS_LEN + 1;
+        sizeof(cudaq::nvqlink::RPCResponse) + 1;
     auto data_bytes = extract_tdata_bytes(sample, kResponseSize);
 
     cudaq::nvqlink::RPCResponse resp{};
     std::memcpy(&resp, data_bytes.data(), sizeof(resp));
     std::uint8_t correction_byte =
-        data_bytes[sizeof(cudaq::nvqlink::RPCResponse) + PTP_TS_LEN];
+        data_bytes[sizeof(cudaq::nvqlink::RPCResponse)];
 
     if (resp.magic == cudaq::nvqlink::RPC_MAGIC_REQUEST) {
       result.rpc_requests++;
@@ -809,11 +804,9 @@ VerifyResult verify_captured_responses(
       result.correction_errors++;
     }
 
-    // PTP round-trip latency: send timestamp from echoed response payload,
+    // PTP round-trip latency: send timestamp from response header,
     // receive timestamp from ILA bits [584:521].
-    const uint8_t *ptp_bytes =
-        data_bytes.data() + sizeof(cudaq::nvqlink::RPCResponse);
-    uint64_t send_raw = extract_echoed_ptp_timestamp(ptp_bytes);
+    uint64_t send_raw = extract_echoed_ptp_timestamp(resp);
     uint64_t recv_raw = extract_ila_ptp_timestamp(sample);
     if (send_raw != 0 && recv_raw != 0) {
       auto send_ts = decode_ptp(send_raw);
