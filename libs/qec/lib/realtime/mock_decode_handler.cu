@@ -71,19 +71,28 @@ __device__ int mock_decode_rpc(const void *input, void *output,
                                std::uint32_t arg_len,
                                std::uint32_t max_result_len,
                                std::uint32_t *result_len) {
+  constexpr uint32_t PTP_TS_LEN = 8;
 
   if (g_mock_decoder != nullptr) {
-    const uint8_t *measurements = static_cast<const uint8_t *>(input);
-    uint8_t *corrections = static_cast<uint8_t *>(output);
+    const uint8_t *in = static_cast<const uint8_t *>(input);
+    uint8_t *out = static_cast<uint8_t *>(output);
+
+    // Echo PTP send timestamp (first 8 bytes) for latency measurement.
+    uint32_t ts = (arg_len >= PTP_TS_LEN) ? PTP_TS_LEN : arg_len;
+    for (uint32_t i = 0; i < ts; ++i)
+      out[i] = in[i];
+
+    // Decode syndrome data (after PTP prefix).
+    const uint8_t *measurements = in + PTP_TS_LEN;
+    uint8_t *corrections = out + PTP_TS_LEN;
 
     const auto &ctx = g_mock_decoder->context();
     g_mock_decoder->decode(measurements, corrections, ctx.num_measurements,
                            ctx.num_observables);
 
-    *result_len = static_cast<std::uint32_t>(ctx.num_observables);
-    return 0; // Success
+    *result_len = PTP_TS_LEN + static_cast<std::uint32_t>(ctx.num_observables);
+    return 0;
   } else {
-    // Error: decoder not set
     *result_len = 0;
     return -1;
   }
@@ -98,40 +107,46 @@ __device__ auto get_mock_decode_rpc_ptr() { return &mock_decode_rpc; }
 __global__ void mock_decode_graph_kernel(
     cudaq::nvqlink::GraphIOContext *io_ctx) {
   if (threadIdx.x == 0 && blockIdx.x == 0) {
+    constexpr uint32_t PTP_TS_LEN = 8;
+
     if (io_ctx == nullptr || io_ctx->rx_slot == nullptr)
       return;
 
     // Parse RPC header from RX slot (input)
     auto *header =
         static_cast<cudaq::nvqlink::RPCHeader *>(io_ctx->rx_slot);
-    uint8_t *measurements = reinterpret_cast<uint8_t *>(header + 1);
+    uint8_t *payload_in = reinterpret_cast<uint8_t *>(header + 1);
 
     // TX slot for response (output)
     auto *response =
         reinterpret_cast<cudaq::nvqlink::RPCResponse *>(io_ctx->tx_slot);
-    uint8_t *corrections =
+    uint8_t *payload_out =
         io_ctx->tx_slot + sizeof(cudaq::nvqlink::RPCResponse);
 
     if (g_mock_decoder != nullptr) {
+      // Echo PTP send timestamp (first 8 bytes) for latency measurement.
+      for (uint32_t i = 0; i < PTP_TS_LEN; ++i)
+        payload_out[i] = payload_in[i];
+
+      const uint8_t *measurements = payload_in + PTP_TS_LEN;
+      uint8_t *corrections = payload_out + PTP_TS_LEN;
+
       const auto &ctx = g_mock_decoder->context();
       g_mock_decoder->decode(measurements, corrections, ctx.num_measurements,
                              ctx.num_observables);
 
-      // Write response header to TX slot
       response->magic = cudaq::nvqlink::RPC_MAGIC_RESPONSE;
       response->status = 0;
-      response->result_len = static_cast<std::uint32_t>(ctx.num_observables);
+      response->result_len =
+          PTP_TS_LEN + static_cast<std::uint32_t>(ctx.num_observables);
       response->request_id = header->request_id;
     } else {
-      // Error: decoder not set
       response->magic = cudaq::nvqlink::RPC_MAGIC_RESPONSE;
       response->status = -1;
       response->result_len = 0;
       response->request_id = header->request_id;
     }
 
-    // Signal completion: write tx_flag so the host/emulator knows the
-    // response is ready.  Must fence before the flag write.
     __threadfence_system();
     if (io_ctx->tx_flag != nullptr)
       *(io_ctx->tx_flag) = io_ctx->tx_flag_value;

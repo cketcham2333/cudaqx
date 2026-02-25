@@ -12,6 +12,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
@@ -43,7 +44,7 @@ constexpr std::uint32_t PLAYER_ENABLE_OFFSET = 0x0004;
 constexpr std::uint32_t RAM_NUM = 16;
 constexpr std::uint32_t RAM_DEPTH = 512;
 
-constexpr std::uint32_t PLAYER_ENABLE = 0x0000'0005; // enable + single-pass (no loop)
+constexpr std::uint32_t PLAYER_ENABLE = 0x0000'000D; // enable + single-pass + ptp_bram_ena
 constexpr std::uint32_t PLAYER_DISABLE = 0x0000'0000;
 
 // Sensor TX streaming threshold register. The Host→FPGA path buffers
@@ -54,7 +55,7 @@ constexpr std::uint32_t PLAYER_DISABLE = 0x0000'0000;
 constexpr std::uint32_t SIF_TX_THRESHOLD_ADDR = 0x0120'0000;
 constexpr std::uint32_t SIF_TX_THRESHOLD_IMMEDIATE = 0x0000'0005;
 
-constexpr std::uint32_t DEFAULT_TIMER_SPACING_US = 120;
+constexpr std::uint32_t DEFAULT_TIMER_SPACING_US = 10;
 constexpr std::uint32_t RF_SOC_TIMER_SCALE = 322;
 
 constexpr std::uint32_t MOCK_DECODE_FUNCTION_ID =
@@ -64,11 +65,12 @@ constexpr std::uint32_t MOCK_DECODE_FUNCTION_ID =
 // ILA Capture Block Constants — from spec_sif_tx.json
 //
 // The SIF TX capture block at 0x4000_0000 records the full 512-bit incoming
-// data bus.  Each captured sample is 521 bits wide:
+// data bus.  Each captured sample is 585 bits wide:
 //   bits [511:0]   sif_tx_axis_tdata_0  — 512-bit raw payload
 //   bit  512       sif_tx_axis_tvalid_0 — valid indicator
 //   bit  513       sif_tx_axis_tlast_0  — last beat of ethernet packet
 //   bits [520:514] sif_ila_wr_tcnt_0    — valid byte count in this beat
+//   bits [584:521] current_ptp_timestamp {sec[31:0], nsec[31:0]}
 //
 // Samples are captured only on clock cycles where valid data is present.
 // The status register at base+0x84 holds the current sample write address,
@@ -79,11 +81,11 @@ constexpr std::uint32_t ILA_BASE_ADDR = 0x4000'0000;
 constexpr std::uint32_t ILA_CTRL_OFFSET = 0x0000;
 constexpr std::uint32_t ILA_STATUS_OFFSET = 0x0080;
 constexpr std::uint32_t ILA_SAMPLE_ADDR_OFFSET = 0x0084;
-constexpr std::uint32_t ILA_W_DATA = 521;
+constexpr std::uint32_t ILA_W_DATA = 585;
 constexpr std::uint32_t ILA_DEPTH = 8192;
-constexpr std::uint32_t ILA_NUM_RAM = (ILA_W_DATA + 31) / 32; // 17
+constexpr std::uint32_t ILA_NUM_RAM = (ILA_W_DATA + 31) / 32; // 19
 constexpr std::uint32_t ILA_W_ADDR = 13;                      // log2(8192)
-constexpr std::uint32_t ILA_W_RAM = 5;                        // ceil(log2(17))
+constexpr std::uint32_t ILA_W_RAM = 5;                        // ceil(log2(19))
 
 constexpr std::uint32_t ILA_CTRL_ENABLE = 0x0000'0001;
 constexpr std::uint32_t ILA_CTRL_RESET = 0x0000'0002;
@@ -95,6 +97,8 @@ constexpr std::uint32_t ILA_TVALID_BIT = 512;
 constexpr std::uint32_t ILA_TLAST_BIT = 513;
 constexpr std::uint32_t ILA_WR_TCNT_LSB = 514;
 constexpr std::uint32_t ILA_WR_TCNT_WIDTH = 7;
+
+constexpr std::uint32_t PTP_TS_LEN = 8;
 
 // ============================================================================
 // Helper Functions
@@ -260,20 +264,26 @@ std::vector<SyndromeEntry> load_syndromes(const std::string &path,
   return entries;
 }
 
+/// Build an RPC request message.
+/// Layout: [RPCHeader][8-byte PTP placeholder][syndrome measurements...]
+/// The FPGA overwrites the PTP placeholder with the PTP send timestamp at
+/// transmit time.
 std::vector<std::uint8_t>
 build_rpc_payload(const std::vector<std::uint8_t> &measurements,
                   std::uint32_t function_id,
                   std::uint32_t request_id = 0) {
+  std::size_t arg_len = PTP_TS_LEN + measurements.size();
   std::vector<std::uint8_t> payload(sizeof(cudaq::nvqlink::RPCHeader) +
-                                    measurements.size());
+                                    arg_len, 0);
 
   auto *header = reinterpret_cast<cudaq::nvqlink::RPCHeader *>(payload.data());
   header->magic = cudaq::nvqlink::RPC_MAGIC_REQUEST;
   header->function_id = function_id;
-  header->arg_len = static_cast<std::uint32_t>(measurements.size());
+  header->arg_len = static_cast<std::uint32_t>(arg_len);
   header->request_id = request_id;
 
-  std::memcpy(payload.data() + sizeof(cudaq::nvqlink::RPCHeader),
+  // First PTP_TS_LEN bytes after header are zero (FPGA injects PTP here).
+  std::memcpy(payload.data() + sizeof(cudaq::nvqlink::RPCHeader) + PTP_TS_LEN,
               measurements.data(), measurements.size());
   return payload;
 }
@@ -661,6 +671,56 @@ extract_tdata_bytes(const std::vector<std::uint32_t> &sample,
 }
 
 // ============================================================================
+// PTP Timestamp Helpers
+// ============================================================================
+
+/// Extract the 64-bit current_ptp_timestamp from ILA bits [584:521].
+std::uint64_t extract_ila_ptp_timestamp(
+    const std::vector<std::uint32_t> &sample) {
+  uint64_t raw = 0;
+  for (int b = 0; b < 64; ++b) {
+    uint32_t bit_pos = 521 + b;
+    uint32_t w = bit_pos / 32;
+    uint32_t off = bit_pos % 32;
+    if ((sample[w] >> off) & 1)
+      raw |= (uint64_t(1) << b);
+  }
+  return raw;
+}
+
+/// Extract the echoed PTP send timestamp from the first 8 bytes of the
+/// RPC response payload.
+std::uint64_t extract_echoed_ptp_timestamp(const std::uint8_t *result_data) {
+  uint64_t raw = 0;
+  for (int i = 0; i < 8; ++i)
+    raw |= uint64_t(result_data[i]) << (i * 8);
+  return raw;
+}
+
+struct PtpTimestamp {
+  uint32_t sec;
+  uint32_t nsec;
+};
+
+PtpTimestamp decode_ptp(uint64_t raw) {
+  return {static_cast<uint32_t>(raw >> 32),
+          static_cast<uint32_t>(raw & 0xFFFF'FFFF)};
+}
+
+int64_t ptp_delta_ns(PtpTimestamp send, PtpTimestamp recv) {
+  int64_t d_sec = static_cast<int64_t>(recv.sec) - send.sec;
+  int64_t d_nsec = static_cast<int64_t>(recv.nsec) - send.nsec;
+  return d_sec * 1'000'000'000LL + d_nsec;
+}
+
+struct LatencySample {
+  uint32_t msg_id;
+  uint32_t send_sec, send_nsec;
+  uint32_t recv_sec, recv_nsec;
+  int64_t delta_ns;
+};
+
+// ============================================================================
 // Correction Verification
 // ============================================================================
 
@@ -673,6 +733,7 @@ struct VerifyResult {
   std::size_t rpc_responses = 0;
   std::size_t non_rpc_frames = 0;
   std::size_t tvalid_zero = 0;
+  std::vector<LatencySample> latency_samples;
 };
 
 /// Scan captured ILA samples for RPC correction responses and compare each
@@ -681,9 +742,10 @@ struct VerifyResult {
 /// Each captured 512-bit data word should contain a complete RPCResponse:
 ///   bytes [0:3]   RPCResponse.magic      = 0x43555153 (RPC_MAGIC_RESPONSE)
 ///   bytes [4:7]   RPCResponse.status     = 0 (success)
-///   bytes [8:11]  RPCResponse.result_len = 1
+///   bytes [8:11]  RPCResponse.result_len = PTP_TS_LEN + num_observables
 ///   bytes [12:15] RPCResponse.request_id = shot index (echoed from request)
-///   byte  [16]    correction value
+///   bytes [16:23] echoed PTP send timestamp
+///   byte  [24]    correction value
 VerifyResult verify_captured_responses(
     const std::vector<std::vector<std::uint32_t>> &samples,
     const std::vector<SyndromeEntry> &syndromes, std::size_t num_expected) {
@@ -703,13 +765,13 @@ VerifyResult verify_captured_responses(
     }
 
     constexpr std::size_t kResponseSize =
-        sizeof(cudaq::nvqlink::RPCResponse) + 1;
+        sizeof(cudaq::nvqlink::RPCResponse) + PTP_TS_LEN + 1;
     auto data_bytes = extract_tdata_bytes(sample, kResponseSize);
 
     cudaq::nvqlink::RPCResponse resp{};
     std::memcpy(&resp, data_bytes.data(), sizeof(resp));
     std::uint8_t correction_byte =
-        data_bytes[sizeof(cudaq::nvqlink::RPCResponse)];
+        data_bytes[sizeof(cudaq::nvqlink::RPCResponse) + PTP_TS_LEN];
 
     if (resp.magic == cudaq::nvqlink::RPC_MAGIC_REQUEST) {
       result.rpc_requests++;
@@ -745,6 +807,21 @@ VerifyResult verify_captured_responses(
                 << ": got=" << static_cast<int>(correction_byte)
                 << " expected=" << static_cast<int>(expected) << " [FAIL]\n";
       result.correction_errors++;
+    }
+
+    // PTP round-trip latency: send timestamp from echoed response payload,
+    // receive timestamp from ILA bits [584:521].
+    const uint8_t *ptp_bytes =
+        data_bytes.data() + sizeof(cudaq::nvqlink::RPCResponse);
+    uint64_t send_raw = extract_echoed_ptp_timestamp(ptp_bytes);
+    uint64_t recv_raw = extract_ila_ptp_timestamp(sample);
+    if (send_raw != 0 && recv_raw != 0) {
+      auto send_ts = decode_ptp(send_raw);
+      auto recv_ts = decode_ptp(recv_raw);
+      int64_t delta = ptp_delta_ns(send_ts, recv_ts);
+      result.latency_samples.push_back(
+          {shot_index, send_ts.sec, send_ts.nsec,
+           recv_ts.sec, recv_ts.nsec, delta});
     }
 
     shots_seen.insert(shot_index);
@@ -1067,6 +1144,51 @@ int main(int argc, char **argv) {
               << "  Header errors:          " << vr.header_errors << "\n"
               << "  Correction errors:      " << vr.correction_errors << "\n"
               << "  Expected shots:         " << num_shots << "\n";
+    if (!vr.latency_samples.empty()) {
+      int64_t lat_min = std::numeric_limits<int64_t>::max();
+      int64_t lat_max = std::numeric_limits<int64_t>::min();
+      int64_t lat_sum = 0;
+      for (auto &s : vr.latency_samples) {
+        lat_sum += s.delta_ns;
+        if (s.delta_ns < lat_min) lat_min = s.delta_ns;
+        if (s.delta_ns > lat_max) lat_max = s.delta_ns;
+      }
+      double lat_avg =
+          static_cast<double>(lat_sum) / vr.latency_samples.size();
+
+      // Print first 5 samples for diagnostic
+      for (std::size_t k = 0; k < 5 && k < vr.latency_samples.size(); ++k) {
+        auto &s = vr.latency_samples[k];
+        std::cout << "  Msg " << std::setw(3) << s.msg_id
+                  << ": send={sec=" << s.send_sec
+                  << ", nsec=" << s.send_nsec
+                  << "} recv={sec=" << s.recv_sec
+                  << ", nsec=" << s.recv_nsec
+                  << "} delta=" << s.delta_ns << " ns\n";
+      }
+
+      std::cout << "\n=== PTP Round-Trip Latency ===\n"
+                << "  Samples:  " << vr.latency_samples.size() << "\n"
+                << "  Min:      " << lat_min << " ns\n"
+                << "  Max:      " << lat_max << " ns\n"
+                << "  Avg:      " << std::fixed << std::setprecision(1)
+                << lat_avg << " ns\n";
+
+      const std::string csv_path = "ptp_latency.csv";
+      std::ofstream csv(csv_path);
+      if (csv.is_open()) {
+        csv << "shot,send_sec,send_nsec,recv_sec,recv_nsec,delta_ns\n";
+        for (auto &s : vr.latency_samples)
+          csv << s.msg_id << "," << s.send_sec << "," << s.send_nsec << ","
+              << s.recv_sec << "," << s.recv_nsec << "," << s.delta_ns
+              << "\n";
+        csv.close();
+        std::cout << "  CSV written: " << csv_path << "\n";
+      }
+    } else {
+      std::cout << "\n  PTP latency: no valid timestamps found\n";
+    }
+
     if (vr.correction_errors > 0 || vr.header_errors > 0) {
       std::cout << "  RESULT: FAIL\n";
       return 1;
