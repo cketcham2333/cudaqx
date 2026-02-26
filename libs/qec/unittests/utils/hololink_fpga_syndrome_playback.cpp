@@ -973,11 +973,6 @@ int main(int argc, char **argv) {
     hololink->reset();
   }
 
-  // Disable block read/write mode for BRAM operations. The FPGA's
-  // control-plane RD_BLOCK/WR_BLOCK path to BRAM addresses returns
-  // RESPONSE_INVALID_ADDR; individual reads/writes work fine.
-  hololink->set_block_enable(false);
-
   // ------------------------------------------------------------------
   // Configure FPGA SIF registers for RDMA target (if provided)
   // ------------------------------------------------------------------

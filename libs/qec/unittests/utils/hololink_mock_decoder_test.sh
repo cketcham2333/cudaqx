@@ -43,7 +43,7 @@ DO_RUN=true
 VERIFY=true
 
 # Directory defaults
-HOLOLINK_DIR="/workspaces/cuda-qx/hololink"
+HOLOLINK_DIR="/workspaces/hololink"
 CUDA_QUANTUM_DIR="/workspaces/cuda-quantum"
 CUDAQX_DIR="/workspaces/cudaqx"
 DATA_DIR=""  # auto-detected if empty
@@ -415,7 +415,7 @@ do_build() {
 
     cmake -G Ninja -S "$HOLOLINK_DIR" -B "$hl_build" \
         -DCMAKE_BUILD_TYPE=Release \
-        -DTARGETARCH="$target_arch" \
+        -DTARGET_ARCH="$target_arch" \
         -DHOLOLINK_BUILD_ONLY_NATIVE=OFF \
         -DHOLOLINK_BUILD_PYTHON=OFF \
         -DHOLOLINK_BUILD_TESTS=OFF \
