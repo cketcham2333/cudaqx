@@ -55,6 +55,8 @@ constexpr std::uint32_t PLAYER_DISABLE = 0x0000'0000;
 constexpr std::uint32_t SIF_TX_THRESHOLD_ADDR = 0x0120'0000;
 constexpr std::uint32_t SIF_TX_THRESHOLD_IMMEDIATE = 0x0000'0005;
 
+constexpr std::uint32_t METADATA_PACKET_ADDR = 0x102C;
+
 constexpr std::uint32_t DEFAULT_TIMER_SPACING_US = 10;
 constexpr std::uint32_t RF_SOC_TIMER_SCALE = 322;
 
@@ -1052,6 +1054,16 @@ int main(int argc, char **argv) {
     ila_reset(*hololink);
     ila_enable(*hololink);
     std::cout << "ILA: armed for capture\n";
+  }
+
+  // ------------------------------------------------------------------
+  // Disable metadata packet (required for bitfile 0x0227+)
+  // Needed for FPGA bitfile 0x0227+; comment out for older bitfiles (e.g. 0x2601).
+  // ------------------------------------------------------------------
+  {
+    std::uint32_t val = hololink->read_uint32(METADATA_PACKET_ADDR);
+    if (!hololink->write_uint32(METADATA_PACKET_ADDR, val | (1u << 16)))
+      throw std::runtime_error("Failed to disable metadata packet");
   }
 
   // ------------------------------------------------------------------
